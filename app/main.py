@@ -1,9 +1,12 @@
 import os
 import re
 import threading
+import ipaddress
+import logging
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, field_validator
 
 from .database import Database
@@ -15,6 +18,10 @@ sim_pin = os.getenv("SMS_SIM_PIN")
 if sim_pin and not re.fullmatch(r"[0-9]{4,8}", sim_pin):
     raise ValueError("SMS_SIM_PIN must contain 4 to 8 digits")
 modem = Modem(os.getenv("SMS_PORT", "/dev/ttyUSB0"), int(os.getenv("SMS_BAUDRATE", "115200")), sim_pin)
+incoming_mode = os.getenv("SMS_INCOMING_MODE", "archive").lower()
+if incoming_mode not in ("archive", "discard", "off"):
+    raise ValueError("SMS_INCOMING_MODE must be archive, discard, or off")
+logger = logging.getLogger(__name__)
 
 
 class MessageRequest(BaseModel):
@@ -41,9 +48,16 @@ class MessageRequest(BaseModel):
 
 
 def worker(stop):
+    next_cleanup = time.monotonic()
     while not stop.is_set():
         message = db.claim()
         if message is None:
+            if incoming_mode != "off" and time.monotonic() >= next_cleanup:
+                next_cleanup = time.monotonic() + 30
+                try:
+                    modem.cleanup_incoming(db.archive_incoming if incoming_mode == "archive" else None)
+                except Exception:
+                    logger.exception("Incoming SMS cleanup failed; will retry")
             stop.wait(1)
             continue
         parts = encode(message["recipient"], message["body"])
@@ -77,6 +91,21 @@ async def lifespan(app):
 app = FastAPI(title="SIM800 SMS API", lifespan=lifespan)
 
 
+@app.get("/modem/status")
+def modem_status(request: Request):
+    allow_remote = os.getenv("SMS_EXPOSE_IDENTIFIERS", "").lower() in ("1", "true", "yes")
+    try:
+        local = bool(request.client and ipaddress.ip_address(request.client.host).is_loopback)
+    except ValueError:
+        local = False
+    # Proxies can rewrite the client address; never treat forwarded requests as local.
+    if "forwarded" in request.headers or "x-forwarded-for" in request.headers:
+        local = False
+    result = modem.status(include_identifiers=local or allow_remote)
+    result["queue"] = db.counts()
+    return result
+
+
 @app.post("/messages", status_code=202)
 def create_message(message: MessageRequest):
     message_id = db.create(message.recipient, message.body)
@@ -86,6 +115,11 @@ def create_message(message: MessageRequest):
 @app.get("/messages")
 def list_messages(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
     return db.list(limit, offset)
+
+
+@app.get("/incoming")
+def list_incoming(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+    return db.list_incoming(limit, offset)
 
 
 @app.get("/messages/{message_id}")

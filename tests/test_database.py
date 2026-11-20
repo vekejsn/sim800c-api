@@ -27,6 +27,10 @@ class DatabaseTests(unittest.TestCase):
         self.db.initialize()
         self.assertEqual(self.db.get(message_id)["status"], "unknown")
 
+    def test_incoming_archive(self):
+        self.db.archive_incoming(7, "001122")
+        self.assertEqual(self.db.list_incoming(10, 0)[0]["pdu"], "001122")
+
 
 if __name__ == "__main__":
     unittest.main()

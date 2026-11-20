@@ -54,6 +54,12 @@ class Database:
                     PRIMARY KEY (message_id, part_number),
                     FOREIGN KEY(message_id) REFERENCES messages(id)
                 );
+                CREATE TABLE IF NOT EXISTS incoming_sms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stored_at TEXT NOT NULL,
+                    sim_index INTEGER NOT NULL,
+                    pdu TEXT NOT NULL
+                );
             """)
             # A process crash during transmission leaves the result unknown.
             rows = db.execute("SELECT id FROM messages WHERE status = 'sending'").fetchall()
@@ -128,4 +134,23 @@ class Database:
         with self.connect() as db:
             return [dict(row) for row in db.execute(
                 "SELECT * FROM messages ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
+            )]
+
+    def counts(self):
+        with self.connect() as db:
+            counts = {status: 0 for status in ("queued", "sending", "sent", "failed", "unknown")}
+            counts.update({row["status"]: row["total"] for row in db.execute(
+                "SELECT status, COUNT(*) AS total FROM messages GROUP BY status"
+            )})
+            return counts
+
+    def archive_incoming(self, index, pdu):
+        with self.connect() as db:
+            db.execute("INSERT INTO incoming_sms (stored_at, sim_index, pdu) VALUES (?, ?, ?)",
+                       (now(), index, pdu))
+
+    def list_incoming(self, limit, offset):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM incoming_sms ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
             )]
